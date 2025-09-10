@@ -4,7 +4,7 @@ require('dotenv').config();
 // ---- importok ----
 const { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder } = require('discord.js');
 const express = require('express');
-const links = require('./links');       // egyszerű email->discordId tároló (Map)
+const links = require('./commands/links');       // egyszerű email->discordId tároló (Map)
 const roleMap = require('./roleMap');   // variant_id -> roleId mapping
 
 // ---- Discord kliens ----
