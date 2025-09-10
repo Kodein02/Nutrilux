@@ -1,76 +1,115 @@
-// ---- .env először! ----
-require('dotenv').config();
+import 'dotenv/config';
+import express from 'express';
+import crypto from 'crypto';
+import { Client, GatewayIntentBits, REST, Routes } from 'discord.js';
+import nodeCron from 'node-cron';
+import db from './db.js';
+import { data as linkCmd, execute as linkExec } from './commands/link.js';
+import roleMap from './roleMap.js';
 
-// ---- importok ----
-const { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder } = require('discord.js');
-const express = require('express');
-const links = require('./link');       // egyszerű email->discordId tároló (Map)
-const roleMap = require('./roleMap');   // variant_id -> roleId mapping
+const app = express();
+app.use(express.json({ verify: (req, res, buf) => { req.rawBody = buf; }}));
 
-// ---- Discord kliens ----
-const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers],
-});
+const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers] });
 
-// Ready esemény – bot bejelentkezett
-client.once('ready', async () => {
-  console.log(`Discord bot bejelentkezett: ${client.user.tag}`);
-
-  // Slash parancs regisztrálás GUILD szinten (gyorsabban megjelenik)
-  const cmd = new SlashCommandBuilder()
-    .setName('link')
-    .setDescription('Email összekötése a Discord fiókoddal (előfizetés ellenőrzéshez).')
-    .addStringOption(o => o.setName('email').setDescription('Shopify e-mailed').setRequired(true));
-
+// --- Slash parancs regisztráció (egyszer futtasd) ---
+async function registerCommands() {
   const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
   await rest.put(
-    Routes.applicationGuildCommands(client.user.id, process.env.GUILD_ID),
-    { body: [cmd.toJSON()] }
+    Routes.applicationGuildCommands((await client.application?.fetch())?.id || process.env.CLIENT_ID, process.env.GUILD_ID),
+    { body: [linkCmd.toJSON()] }
   );
-  console.log('Slash parancs regisztrálva: /link');
+}
+
+// --- Helper: role grant/remove ---
+async function addRoles(discordId, variantIds) {
+  const guild = await client.guilds.fetch(process.env.GUILD_ID);
+  const member = await guild.members.fetch(discordId);
+  await member.roles.add(process.env.START_ROLE_ID);
+  for (const v of variantIds) {
+    const r = roleMap[String(v)];
+    if (r) await member.roles.add(r);
+  }
+}
+
+async function removeAllRoles(discordId) {
+  const guild = await client.guilds.fetch(process.env.GUILD_ID);
+  const member = await guild.members.fetch(discordId);
+  await member.roles.remove([
+    process.env.START_ROLE_ID,
+    process.env.POWERBUILD_ROLE_ID,
+    process.env.FITBURN_ROLE_ID,
+    process.env.GLOWBALANCE_ROLE_ID,
+    process.env.IMMUNEGUARD_ROLE_ID,
+    process.env.FLEXPROTECT_ROLE_ID
+  ].filter(Boolean));
+}
+
+// --- Webhook (Seal → mi) ---
+app.post('/webhooks/seal', async (req, res) => {
+  // ha van HMAC headered, itt tudod ellenőrizni (req.rawBody + secret)...
+  try {
+    const event = req.body?.event || req.body?.type || req.body?.status?.event;
+    const email = (req.body?.customer_email || req.body?.customer?.email || '').toLowerCase();
+    const variants = Array.isArray(req.body?.variants)
+      ? req.body.variants.map(v => String(v.variant_id || v))
+      : (req.body?.variant_id ? [String(req.body.variant_id)] : []);
+
+    // email → discord_id lookup
+    const link = db.prepare('SELECT discord_id FROM links WHERE email=?').get(email);
+    if (!link) { return res.status(200).send('ok'); }
+
+    if (event === 'subscription_created' || event === 'subscription_reactivated') {
+      await addRoles(link.discord_id, variants);
+      db.prepare('REPLACE INTO states(discord_id,status,variants,grace_until,updated_at) VALUES(?,?,?,?,?)')
+        .run(link.discord_id, 'active', JSON.stringify(variants), null, Date.now());
+    }
+    else if (event === 'subscription_canceled' || event === 'subscription_expired') {
+      await removeAllRoles(link.discord_id);
+      db.prepare('REPLACE INTO states(discord_id,status,variants,grace_until,updated_at) VALUES(?,?,?,?,?)')
+        .run(link.discord_id, 'canceled', '[]', null, Date.now());
+    }
+    else if (event === 'subscription_paused') {
+      const grace = Date.now() + 7 * 24 * 60 * 60 * 1000;
+      db.prepare('REPLACE INTO states(discord_id,status,variants,grace_until,updated_at) VALUES(?,?,?,?,?)')
+        .run(link.discord_id, 'paused', JSON.stringify(variants), grace, Date.now());
+      // szerepeket MÉG NEM vesszük el (grace)
+    }
+    else if (event === 'payment_failed') {
+      await removeAllRoles(link.discord_id); // kérésetek szerint azonnal
+      db.prepare('REPLACE INTO states(discord_id,status,variants,grace_until,updated_at) VALUES(?,?,?,?,?)')
+        .run(link.discord_id, 'payment_failed', '[]', null, Date.now());
+    }
+
+    res.status(200).send('ok');
+  } catch (e) {
+    console.error(e);
+    res.status(500).send('err');
+  }
 });
 
-// /link parancs kezelése
+// --- Napi cron: grace lejárat kezelése ---
+nodeCron.schedule('0 3 * * *', () => { // minden nap 03:00
+  const rows = db.prepare('SELECT discord_id, grace_until FROM states WHERE status="paused" AND grace_until IS NOT NULL').all();
+  const now = Date.now();
+  rows.forEach(async r => {
+    if (r.grace_until < now) {
+      await removeAllRoles(r.discord_id);
+      db.prepare('UPDATE states SET status="paused_removed", updated_at=? WHERE discord_id=?').run(Date.now(), r.discord_id);
+    }
+  });
+});
+
+// --- Discord bot események ---
+client.on('ready', async () => {
+  console.log(`Logged in as ${client.user.tag}`);
+  await registerCommands();
+});
 client.on('interactionCreate', async (i) => {
   if (!i.isChatInputCommand()) return;
-  if (i.commandName !== 'link') return;
-
-  const email = i.options.getString('email')?.trim().toLowerCase();
-  if (!email) return i.reply({ content: 'Adj meg egy érvényes e-mail címet!', ephemeral: true });
-
-  links.set(email, i.user.id); // elmentjük az összerendelést
-  await i.reply({ content: `Összekötve ezzel az e-maillel: **${email}** ✅`, ephemeral: true });
-
-  const logCh = client.channels.cache.get(process.env.BOT_LOG_CHANNEL_ID);
-  logCh?.send(`🔗 /link: <@${i.user.id}> ↔ ${email}`);
+  if (i.commandName === 'link') return linkExec(i);
 });
 
-// Bot bejelentkezés
+// --- start ---
 client.login(process.env.DISCORD_TOKEN);
-
-// ---- Express szerver ----
-const app = express();
-app.use(express.json());
-
-// Főoldal teszt
-app.get('/', (req, res) => {
-  res.send('Nutrilux server running 🚀');
-});
-
-// Seal webhook
-app.post('/webhooks/seal', async (req, res) => {
-  console.log('Webhook received:', req.body);
-  const logCh = client.channels.cache.get(process.env.BOT_LOG_CHANNEL_ID);
-
-  const { event, customer_email, variant_id, variants } = req.body || {};
-  logCh?.send(`🧩 Webhook: **${event}** | ${customer_email || 'n/a'} | variant: ${variant_id || 'n/a'}`);
-
-  // Itt később: email -> discordId keresés, role kiosztás/levétel
-  // (most csak logolunk, hogy lásd: minden bejön)
-
-  res.status(200).send('ok');
-});
-
-// Render miatt env PORT-ot használj!
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Running on port ${PORT}`));
+app.listen(process.env.PORT || 3000, () => console.log('HTTP up'));
